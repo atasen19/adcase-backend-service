@@ -1,0 +1,124 @@
+name: Deploy to Amazon ECS
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  release_tag:
+    name: Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.split.outputs.fragment }}
+    steps:
+      - name: Get Release Tag
+        id: release-tag
+        run: |
+          echo ::set-output name=tag::$(echo $GITHUB_REF | cut -d "[" -f2 | cut -d "]" -f1)
+        env:
+          GITHUB_REF: $GITHUB_REF
+
+      - name: Split tag name
+        env:
+          TAG: ${{ steps.release-tag.outputs.tag }}
+        id: split
+        run: echo "::set-output name=fragment::${TAG#*-}"
+
+  deploy:
+    needs: release_tag
+    if: contains(fromJSON('["sandbox", "staging", "production"]'), ${{needs.release_tag.outputs.tag}})
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: ${{needs.release_tag.outputs.tag}}
+    strategy:
+      matrix:
+        app: [adcase-api]
+
+    steps:
+      - name: Uppercase/Lowercase/Capitalized
+        id: string
+        uses: ASzc/change-string-case-action@v5
+        with:
+          string: ${{ matrix.app }}
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEPLOYER_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_DEPLOYER_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Remove the tag latest from previous ${{ matrix.app }} Service image
+        run: |
+          aws ecr batch-delete-image --repository-name ${{ matrix.app }}/${{needs.release_tag.outputs.tag}} --image-ids imageTag=latest
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          aws-access-key-id: ${{ secrets.AWS_DEPLOYER_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_DEPLOYER_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Get short SHA for ${{ matrix.app }} App
+        id: slug
+        run: echo "sha7=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Keep last 6 images in ${{ matrix.app }}/${{needs.release_tag.outputs.tag}} ECR repository
+        uses: LeiaInc/devops-delete-old-aws-ecr-images@v1
+        with:
+          repo-name: ${{ matrix.app }}/${{needs.release_tag.outputs.tag}}
+          qtd-images: 6
+
+      - name: Build, tag, and push ${{ matrix.app }} Service image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build a docker container and          
+          # push it to ECR so that it can          
+          # be deployed to ECS.
+          docker build -t $ECR_REGISTRY/${{ matrix.app }}/${{needs.release_tag.outputs.tag}}:${{ steps.slug.outputs.sha7 }} -t $ECR_REGISTRY/${{ matrix.app }}/${{needs.release_tag.outputs.tag}}:latest -f ./Dockerfile.prod .
+          docker push --all-tags $ECR_REGISTRY/adcas-api/${{needs.release_tag.outputs.tag}}          
+          echo "::set-output name=${{ matrix.app }}_image::$ECR_REGISTRY/${{ matrix.app }}/${{needs.release_tag.outputs.tag}}:$IMAGE_TAG"
+      - name: Replace AWS Account ID in ${{ matrix.app }} Service Task Definition
+        run: sed -i 's/{AWS_ACCOUNT_NO}/${{ secrets.AWS_ACCOUNT_NO }}/g' ecs-${{ matrix.app }}-task-definition.json
+
+      - name: Download ${{ matrix.app }} Service task definition
+        id: download-service-task
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ matrix.app }}-${{ needs.release_tag.outputs.tag }}-task-definition --query taskDefinition > ecs-${{ matrix.app }}-task-definition.json
+            echo "::set-output name=revision::$(($(cat ecs-${{ matrix.app }}-task-definition.json | jq .revision) - 1))"
+      - name: Deploy Amazon ECS task definition for ${{ matrix.app }} Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ./ecs-${{ matrix.app }}-task-definition.json
+          service: ${{ matrix.app }}-${{ needs.release_tag.outputs.tag }}-service
+          cluster: ${{ needs.release_tag.outputs.tag }}-cluster
+
+      - name: Force new deployment of ${{ matrix.app }} Service
+        run: |
+          aws ecs update-service --cluster ${{ needs.release_tag.outputs.tag }}-cluster --service ${{ matrix.app }}-${{ needs.release_tag.outputs.tag }}-service --force-new-deployment
+      - name: De-register (latest-2) revision of ${{ matrix.app }} Service
+        if: ${{ steps.download-service-task.outputs.revision > 0 }}
+        run: |
+          aws ecs deregister-task-definition \
+            --task-definition ${{ matrix.app }}-${{ needs.release_tag.outputs.tag }}-task-definition:${{ steps.download-service-task.outputs.revision }}
+      # - name: Create New Relic deployment marker
+      #   uses: newrelic/deployment-marker-action@v1
+      #   env:
+      #     APP: ${{ steps.string.outputs.uppercase }}
+      #   with:
+      #     accountId: ${{ secrets.NEW_RELIC_ACCOUNT_ID }}
+      #     apiKey: ${{ secrets.NEW_RELIC_API_KEY }}
+      #     applicationId: ${{ secrets[format('NEW_RELIC_{0}_APPLICATION_ID', env.APP )] }}
+      #     revision: "${{ steps.slug.outputs.sha7 }}"
+      #     region: EU
+      #     user: ${{ secrets.NEW_RELIC_DEPLOYMENT_MARKER_USER}}
